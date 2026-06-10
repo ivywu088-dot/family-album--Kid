@@ -630,7 +630,7 @@
         <div class="setup-icon">📁</div>
         <div class="setup-text">
           <strong>照片文件夹</strong>
-          <span id="photoStatus">未连接</span>
+          <span id="photoStatus">未连接 · 建议选 E:\SVAVO 工作备份\趁早AI\aiworkshop</span>
         </div>
         <button class="setup-btn" id="btnPickFolder">选择文件夹</button>
       </div>
@@ -651,8 +651,12 @@
       <div class="setup-foot">
         ⚠️ <strong>仅在 Chrome / Edge / Opera 浏览器可用此自动连接方式</strong>(基于 File System Access API)。<br>
         若使用 Safari / Firefox,请改用 <code>拖入文件夹</code> 方式 — 在主页"宥宥的足迹"区域直接拖入照片即可。<br><br>
-        📌 推荐路径: <code>C:\Users\Alex\Desktop\aiworkshop\photo</code><br><br>
-        💡 <strong>首次使用说明</strong>:选完照片后会自动保存到浏览器缓存。<strong>关闭页面后再次打开</strong>,照片会<strong>自动恢复</strong>而无需重新选择。<br>
+        📌 照片与音乐都在 <code>E:\SVAVO 工作备份\趁早AI\aiworkshop\</code>(同一目录)。<br>
+        👉 点「选择文件夹」选这个目录即可一次加载全部照片。<br>
+        👉 点「选择音乐」选 <code>Perfect - Ed Sheeran.flac</code>。<br><br>
+        💡 <strong>本地双击打开</strong>(在 E 盘 aiworkshop 目录里),FLAC 走相对路径可自动播放。<br>
+        💡 <strong>GitHub Pages 上打开</strong>,FLAC 不在服务器上,需要选一次,之后会记住。<br>
+        💡 选完照片/音乐会<strong>自动存到浏览器缓存</strong>。关闭再打开,会自动恢复。<br>
         <button class="setup-btn" id="btnTestStorage" style="margin-top:12px;font-size:11px;padding:6px 14px">🔧 测试浏览器存储</button>
       </div>
     </div>
@@ -733,7 +737,9 @@
         <button class="ctrl" id="forward" aria-label="前进10秒" disabled>↻</button>
       </div>
     </div>
-    <audio id="audio" preload="auto" loop></audio>
+    <!-- src 用相对路径:HTML 与 FLAC 在同目录时,本地双击打开可直接播放
+         部署到 GitHub Pages 时此路径会失效(文件不在),需要从设置卡选择一次 -->
+    <audio id="audio" src="Perfect - Ed Sheeran.flac" preload="auto" loop></audio>
   </div>
 
   <!-- 隐藏的文件选择器: 照片文件夹 / 音乐文件 -->
@@ -750,7 +756,11 @@
    CONFIG
 ============================================================== */
 const CONFIG = {
-  // 期望的默认文件夹名(用于提示)
+  // 项目根目录(HTML / 照片 / 音乐 都在同一目录)
+  projectDir: "E:/SVAVO 工作备份/趁早AI/aiworkshop",
+  // 音乐文件名(在项目根目录)
+  musicFile: "Perfect - Ed Sheeran.flac",
+  // 推荐的默认文件夹名(用于提示)
   preferredFolder: "aiworkshop",
   // 支持的图片扩展
   IMG_EXT: /\.(jpe?g|png|gif|webp|bmp|heic|heif|avif|svg|jfif|tiff?)$/i,
@@ -1592,9 +1602,26 @@ audio.addEventListener("timeupdate", () => {
   progressBar.style.width = (audio.currentTime / audio.duration * 100) + "%";
   curTime.textContent = fmtTime(audio.currentTime);
 });
-audio.addEventListener("loadedmetadata", () => durTime.textContent = fmtTime(audio.duration));
+audio.addEventListener("loadedmetadata", () => {
+  durTime.textContent = fmtTime(audio.duration);
+  // 自动检测:如果 audio.src 仍是相对路径(没被 applyMusicFile 覆盖过),且能加载 → 自动启用播放器
+  if (audio.src && !state.musicUrl && audio.duration > 0) {
+    const name = decodeURIComponent(audio.src.split("/").pop());
+    state.currentMusicName = name;
+    document.getElementById("trackName").textContent = name.replace(/\.[^.]+$/, "");
+    document.getElementById("trackArtist").textContent = "♪ 等待播放 (相对路径已加载)";
+    document.getElementById("musicStatus").innerHTML = '<span class="ok">✓ ' + name + ' · 同目录已自动加载</span>';
+    document.getElementById("play").disabled = false;
+    document.getElementById("rewind").disabled = false;
+    document.getElementById("forward").disabled = false;
+    ready.music = true;
+    document.getElementById("btnPickMusic").textContent = "更换";
+    updateEnterBtn();
+    console.log("♪ 音乐已通过相对路径自动加载:", name);
+  }
+});
 audio.addEventListener("ended", () => setPlaying(false));
-audio.addEventListener("error", () => { console.warn("audio error"); toast("音乐播放出错"); });
+audio.addEventListener("error", () => { console.warn("audio error (相对路径失败,需要从设置卡选择)"); });
 
 progress.addEventListener("click", (e) => {
   if (!audio.duration) return;
