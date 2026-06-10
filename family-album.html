@@ -590,7 +590,7 @@
     </div>
     <div class="nav-meta">
       <span class="pill" id="photoCount">0 张照片</span>
-      <span class="pill"><span class="src" id="srcLabel">未连接</span></span>
+      <span class="pill" id="cachePill" title="浏览器本地缓存状态">💾 缓存 0</span>
       <span class="pill" id="dateText">2026</span>
     </div>
   </nav>
@@ -651,7 +651,9 @@
       <div class="setup-foot">
         ⚠️ <strong>仅在 Chrome / Edge / Opera 浏览器可用此自动连接方式</strong>(基于 File System Access API)。<br>
         若使用 Safari / Firefox,请改用 <code>拖入文件夹</code> 方式 — 在主页"宥宥的足迹"区域直接拖入照片即可。<br><br>
-        📌 推荐路径: <code>C:\Users\Alex\Desktop\aiworkshop\photo</code>
+        📌 推荐路径: <code>C:\Users\Alex\Desktop\aiworkshop\photo</code><br><br>
+        💡 <strong>首次使用说明</strong>:选完照片后会自动保存到浏览器缓存。<strong>关闭页面后再次打开</strong>,照片会<strong>自动恢复</strong>而无需重新选择。<br>
+        <button class="setup-btn" id="btnTestStorage" style="margin-top:12px;font-size:11px;padding:6px 14px">🔧 测试浏览器存储</button>
       </div>
     </div>
   </div>
@@ -849,88 +851,130 @@ async function loadMusicFromDB() {
 }
 
 /* ==============================================================
-   PHOTO CACHE  (照片 Blob 缓存 — 跨会话持久化的关键)
-   不依赖 FSA,任何浏览器、任何 HTTPS 都能用
+   PHOTO CACHE  (Cache API — 比 IndexedDB 更可靠的 Blob 存储)
+   不依赖 FSA、不依赖 IndexedDB Blob 兼容性,任何浏览器都支持
 ============================================================== */
+const PHOTO_CACHE_NAME = "family-album-photos-v2";
+const PHOTO_META_KEY   = "family-album-photos-meta";  // 存储照片元数据索引
+
+// 元数据存 localStorage (轻量,只为索引)
+function readPhotoMeta() {
+  try { return JSON.parse(localStorage.getItem(PHOTO_META_KEY) || "[]"); } catch (e) { return []; }
+}
+function writePhotoMeta(arr) {
+  try { localStorage.setItem(PHOTO_META_KEY, JSON.stringify(arr)); } catch (e) { console.warn("meta write failed:", e); }
+}
+
 async function savePhotosToCache(photos) {
+  if (!("caches" in window)) {
+    console.error("❌ Cache API 不支持,无法持久化");
+    return;
+  }
   try {
-    const db = await openDB();
-    return new Promise((resolve) => {
-      const tx = db.transaction("photos", "readwrite");
-      const store = tx.objectStore("photos");
-      const now = Date.now();
-      for (const p of photos) {
-        if (!p.file) continue;
-        const key = `${p.file.name}_${p.file.size}_${p.file.lastModified || 0}`;
-        store.put({
-          key,
-          blob: p.file,
-          name: p.file.name,
-          size: p.file.size,
-          type: p.file.type,
-          lastModified: p.file.lastModified || now,
-          cachedAt: now
-        }, key);
-      }
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => resolve();
-    });
-  } catch (e) { console.warn("savePhotosToCache:", e); }
+    const cache = await caches.open(PHOTO_CACHE_NAME);
+    const meta = [];
+    for (const p of photos) {
+      if (!p.file) continue;
+      const key = `/${encodeURIComponent(p.file.name)}_${p.file.size}_${p.file.lastModified || 0}`;
+      const response = new Response(p.file, {
+        headers: {
+          "Content-Type": p.file.type || "application/octet-stream",
+          "X-Photo-Name": encodeURIComponent(p.file.name),
+          "X-Photo-Size": String(p.file.size),
+          "X-Photo-MTime": String(p.file.lastModified || 0),
+          "X-Cached-At": String(Date.now())
+        }
+      });
+      await cache.put(key, response);
+      meta.push({
+        key,
+        name: p.file.name,
+        size: p.file.size,
+        type: p.file.type,
+        mtime: p.file.lastModified || 0,
+        cachedAt: Date.now()
+      });
+    }
+    writePhotoMeta(meta);
+    console.log(`✅ Cache API 已保存 ${meta.length} 张照片`);
+  } catch (e) {
+    console.error("❌ savePhotosToCache 失败:", e);
+  }
 }
 
 async function loadPhotosFromCache() {
+  if (!("caches" in window)) {
+    console.warn("⚠️ Cache API 不支持");
+    return [];
+  }
   try {
-    const db = await openDB();
-    return new Promise((resolve) => {
-      const tx = db.transaction("photos", "readonly");
-      const req = tx.objectStore("photos").getAll();
-      req.onsuccess = () => {
-        const items = req.result || [];
-        const photos = items.map(item => {
-          const file = new File([item.blob], item.name, {
-            type: item.type,
-            lastModified: item.lastModified
-          });
-          return {
-            file,
-            src: URL.createObjectURL(file),
-            title: "正在识别色彩…",
-            date: item.lastModified ? new Date(item.lastModified).toLocaleDateString("zh-CN") : "",
-            source: "cache",
-            cachedAt: item.cachedAt
-          };
-        });
-        // 按缓存时间倒序 (新加的在前)
-        photos.sort((a, b) => (b.cachedAt || 0) - (a.cachedAt || 0));
-        resolve(photos);
-      };
-      req.onerror = () => resolve([]);
-    });
-  } catch (e) { return []; }
+    const cache = await caches.open(PHOTO_CACHE_NAME);
+    const meta = readPhotoMeta();
+    const photos = [];
+    for (const m of meta) {
+      const res = await cache.match(m.key);
+      if (!res) { console.warn("  - 找不到缓存项:", m.name); continue; }
+      const blob = await res.blob();
+      const file = new File([blob], m.name, { type: m.type, lastModified: m.mtime });
+      photos.push({
+        file,
+        src: URL.createObjectURL(file),
+        title: "正在识别色彩…",
+        date: m.mtime ? new Date(m.mtime).toLocaleDateString("zh-CN") : "",
+        source: "cache",
+        cachedAt: m.cachedAt
+      });
+    }
+    photos.sort((a, b) => (b.cachedAt || 0) - (a.cachedAt || 0));
+    console.log(`✅ Cache API 恢复 ${photos.length} 张照片`);
+    return photos;
+  } catch (e) {
+    console.error("❌ loadPhotosFromCache 失败:", e);
+    return [];
+  }
 }
 
 async function clearPhotoCache() {
   try {
-    const db = await openDB();
-    return new Promise((resolve) => {
-      const tx = db.transaction("photos", "readwrite");
-      tx.objectStore("photos").clear();
-      tx.oncomplete = resolve;
-      tx.onerror = resolve;
-    });
-  } catch (e) {}
+    await caches.delete(PHOTO_CACHE_NAME);
+    writePhotoMeta([]);
+    console.log("🗑️ 已清空照片缓存");
+  } catch (e) { console.warn("clearPhotoCache:", e); }
 }
 
 async function getCacheInfo() {
   try {
-    const db = await openDB();
-    return new Promise((resolve) => {
-      const tx = db.transaction("photos", "readonly");
-      const req = tx.objectStore("photos").count();
-      req.onsuccess = () => resolve(req.result || 0);
-      req.onerror = () => resolve(0);
-    });
-  } catch (e) { return 0; }
+    const meta = readPhotoMeta();
+    const totalSize = meta.reduce((s, m) => s + (m.size || 0), 0);
+    return { count: meta.length, size: totalSize, lastAt: meta[0]?.cachedAt || 0 };
+  } catch (e) { return { count: 0, size: 0, lastAt: 0 }; }
+}
+
+// 诊断: 测试浏览器是否支持存储
+async function testStorage() {
+  const results = { cacheAPI: false, indexedDB: false, localStorage: false, error: [] };
+  try {
+    if ("caches" in window) {
+      const c = await caches.open("test-cache");
+      await c.put("/test", new Response("ok"));
+      const r = await c.match("/test");
+      results.cacheAPI = !!(r && await r.text() === "ok");
+      await caches.delete("test-cache");
+    }
+  } catch (e) { results.error.push("Cache API: " + e.message); }
+  try {
+    localStorage.setItem("__test__", "1");
+    results.localStorage = localStorage.getItem("__test__") === "1";
+    localStorage.removeItem("__test__");
+  } catch (e) { results.error.push("localStorage: " + e.message); }
+  try {
+    const req = indexedDB.open("__test__", 1);
+    await new Promise((res, rej) => { req.onsuccess = res; req.onerror = rej; req.onupgradeneeded = () => req.result.createObjectStore("x"); });
+    results.indexedDB = true;
+    indexedDB.deleteDatabase("__test__");
+  } catch (e) { results.error.push("IndexedDB: " + e.message); }
+  console.log("🔍 存储诊断:", results);
+  return results;
 }
 
 /* ==============================================================
@@ -1252,9 +1296,16 @@ document.getElementById("lightbox").addEventListener("click", (e) => { if (e.tar
 function updateCount() {
   document.getElementById("photoCount").textContent = `${state.photos.length} 张照片`;
   document.getElementById("dateText").textContent = new Date().getFullYear();
-  if (state.dirHandle) {
-    document.getElementById("srcLabel").textContent = "📁 " + state.dirHandle.name;
-  }
+  updateCachePill();
+}
+
+async function updateCachePill() {
+  const info = await getCacheInfo();
+  const pill = document.getElementById("cachePill");
+  if (!pill) return;
+  const sizeMB = (info.size / 1024 / 1024).toFixed(1);
+  pill.textContent = `💾 缓存 ${info.count} · ${sizeMB}MB`;
+  pill.title = `浏览器本地缓存 ${info.count} 张照片,共 ${sizeMB}MB`;
 }
 
 /* ==============================================================
@@ -1584,14 +1635,12 @@ document.getElementById("btnAddMore").addEventListener("click", () => folderInpu
 document.getElementById("btnChangeFolder").addEventListener("click", onPickFolder);
 document.getElementById("btnClearCache").addEventListener("click", async () => {
   if (!confirm("确定要清空浏览器中缓存的所有照片吗?此操作不可撤销。")) return;
-  // 释放所有 blob URL
   state.photos.forEach(p => p.src?.startsWith("blob:") && URL.revokeObjectURL(p.src));
   await clearPhotoCache();
   await removeHandle("photoDir");
   state.photos = [];
   state.dirHandle = null;
   ready.photos = false;
-  // 隐藏画廊,显示设置面板
   document.getElementById("gallery").classList.remove("has-photos");
   document.getElementById("hero").classList.remove("has-photos");
   document.getElementById("dropzone").style.display = "none";
@@ -1600,7 +1649,20 @@ document.getElementById("btnClearCache").addEventListener("click", async () => {
   document.getElementById("btnPickFolder").textContent = "选择文件夹";
   document.getElementById("photoCount").textContent = "0 张照片";
   updateEnterBtn();
+  updateCachePill();
   toast("已清空缓存");
+});
+
+// 存储诊断: 帮助排查为什么缓存不工作
+document.getElementById("btnTestStorage").addEventListener("click", async () => {
+  const r = await testStorage();
+  const status = `Cache API: ${r.cacheAPI ? "✓" : "✗"}  IndexedDB: ${r.indexedDB ? "✓" : "✗"}  localStorage: ${r.localStorage ? "✓" : "✗"}`;
+  if (r.cacheAPI) {
+    toast("✓ 浏览器存储正常,缓存应该能正常工作");
+    alert("存储诊断结果:\n\n" + status + "\n\n详细日志请打开 DevTools (F12) → Console 查看");
+  } else {
+    alert("⚠️ 存储可能有问题:\n\n" + status + "\n\n错误:\n" + r.error.join("\n") + "\n\n建议:\n1. 不要使用无痕模式\n2. 不要禁用 Cookies/存储\n3. 尝试 Chrome / Edge 浏览器");
+  }
 });
 
 // "进入相册 →" 按钮: 关闭设置面板并自动开始播放
@@ -1625,6 +1687,7 @@ document.getElementById("trackName").title = "点击更换音乐";
   // 启动 bokeh 粒子 + 初始日期章
   spawnBokeh();
   updateHeroDateStamp();
+  await updateCachePill();
 
   if (!FSA_SUPPORTED) {
     document.querySelector(".setup-foot").innerHTML =
@@ -1632,7 +1695,8 @@ document.getElementById("trackName").title = "点击更换音乐";
   }
   let photosRestored = false, musicRestored = false;
 
-  /* === Step 1: 优先从 IndexedDB Blob 缓存恢复照片(最可靠) === */
+  /* === Step 1: 优先从 Cache API 恢复照片 === */
+  console.log("🔍 boot: 正在检查照片缓存…");
   const cachedPhotos = await loadPhotosFromCache();
   if (cachedPhotos.length) {
     state.photos = cachedPhotos;
@@ -1647,9 +1711,12 @@ document.getElementById("trackName").title = "点击更换音乐";
     const cacheCountEl = document.getElementById("photoCount");
     if (cacheCountEl) cacheCountEl.innerHTML = `${cachedPhotos.length} 张照片 <span style="opacity:.6;font-size:11px;margin-left:6px">· 已从缓存恢复</span>`;
     toast(`✓ 已从缓存恢复 ${cachedPhotos.length} 张照片`);
+    console.log("✅ 照片已自动恢复");
+  } else {
+    console.log("ℹ️ 照片缓存为空,需要手动选择或拖入");
   }
 
-  /* === Step 2: 尝试 FSA 同步最新照片(可选) === */
+  /* === Step 2: 尝试 FSA 同步最新(可选) === */
   const dirHandle = await loadHandle("photoDir");
   if (dirHandle) {
     state.dirHandle = dirHandle;
@@ -1657,7 +1724,6 @@ document.getElementById("trackName").title = "点击更换音乐";
     if (perm === "granted") {
       document.getElementById("photoStatus").innerHTML = '<span class="ok">✓ ' + dirHandle.name + ' · 已就绪</span>';
       document.getElementById("btnPickFolder").textContent = "更换";
-      // 同步磁盘最新到缓存
       try {
         const fresh = await readPhotosFromHandle(dirHandle);
         if (fresh.length) {
@@ -1677,7 +1743,7 @@ document.getElementById("trackName").title = "点击更换音乐";
     }
   }
 
-  /* === Step 3: 恢复音乐(从 IndexedDB Blob) === */
+  /* === Step 3: 恢复音乐 === */
   const stored = await loadMusicFromDB();
   if (stored && stored.blob) {
     const file = new File([stored.blob], stored.name, { type: stored.type || "audio/flac" });
